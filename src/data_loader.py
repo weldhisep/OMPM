@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Dict, Any, Optional
 
-from src.config import (
+from config import (
     get_default_economic_params,
     get_default_market_params_deterministic,
 )
