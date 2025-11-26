@@ -1,12 +1,19 @@
 # src/models/model1_deterministic.py
 
 from typing import Dict, Any, Optional
+from pathlib import Path
+import sys
 
 import gurobipy as gp
 from gurobipy import GRB
 
-from data_loader import load_inputs, ModelType
-from economics import present_value_factor
+# Ensure project root is on sys.path when run directly
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data_loader import load_inputs, ModelType
+from src.economics import present_value_factor
 
 
 def build_model1(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
@@ -118,3 +125,11 @@ def solve_model1(
         "N_opt": N_opt,
         "NPV_eur": obj_val,
     }
+
+
+if __name__ == "__main__":
+    results = solve_model1()
+    print(f"Optimal capacity K* = {results['K_opt_mw']:.2f} MW")
+    print(f"Turbine size S*      = {results['S_opt_mw']:.2f} MW")
+    print(f"Number of turbines N* = {results['N_opt']:.2f}")
+    print(f"Project NPV          = {results['NPV_eur']:.2f} EUR")

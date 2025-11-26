@@ -1,28 +1,34 @@
 # src/main.py
 
 import argparse
-from models.model1_deterministic import build_and_solve_model1
-from models.model2_multi_period import build_and_solve_model2
-from models.model3_stochastic import build_and_solve_model3
+from pathlib import Path
+import sys
+
+# Ensure project root is on sys.path when run directly
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.models.model1_deterministic import solve_model1
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        choices=["1", "2", "3"],
+        choices=["1"],
         default="1",
-        help="Which model to run (1=deterministic, 2=multi-period, 3=stochastic)."
+        help="Which model to run (1=deterministic)."
     )
     args = parser.parse_args()
 
     if args.model == "1":
-        res = build_and_solve_model1()
-    elif args.model == "2":
-        res = build_and_solve_model2()
+        res = solve_model1()
     else:
-        res = build_and_solve_model3()
+        raise NotImplementedError("Only model 1 is implemented.")
 
     print("Results:", res)
+
 
 if __name__ == "__main__":
     main()
