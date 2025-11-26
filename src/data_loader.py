@@ -94,11 +94,47 @@ def _load_market_data_model2() -> Dict[str, Any]:
 
 def _load_market_data_model3() -> Dict[str, Any]:
     """
-    For the stochastic model (stub for now).
-    You will later load scenarios/scenario tree here.
+    Loads random but realistic scenario data for Model 3 (stochastic).
+    This is where all scenario values (rho, forecast, prices, probabilities)
+    should be created or loaded.
     """
+
+    import numpy as np
+
+    # --- dimensions ---
+    T = 24              # 24 hours
+    S = 6               # number of scenarios
+
+    # --- Generate realistic CF patterns ---
+    rho = np.zeros((T, S))
+    for s in range(S):
+        base = 0.35 + 0.10 * np.sin(np.linspace(0, 2*np.pi, T))
+        noise = np.random.normal(0, 0.05, T)
+        scale = np.random.normal(1.0, 0.15)
+        rho[:, s] = np.clip(scale * (base + noise), 0, 1)
+
+    # --- Forecast CF ---
+    rho_forecast = np.clip(rho + np.random.normal(0, 0.06, rho.shape), 0, 1)
+
+    # --- Day-ahead prices ---
+    price_da = 120 - 40 * rho + np.random.normal(0, 3, size=(T, S))
+    price_da = np.clip(price_da, 20, 200)
+
+    # --- Balancing prices ---
+    price_bal = price_da * (1 + np.random.normal(0, 0.05, size=price_da.shape))
+
+    # --- Equal probabilities ---
+    pi = np.ones(S) / S
+
+    scenarios = {
+        "rho": rho,
+        "rho_forecast": rho_forecast,
+        "price_da": price_da,
+        "price_bal": price_bal,
+        "probabilities": pi,
+    }
+
     return {
         "type": "stochastic",
-        "scenarios": None,
-        "scenario_probabilities": None,
+        "scenarios": scenarios,
     }

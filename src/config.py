@@ -10,6 +10,8 @@ class EconomicParams:
     lifetime_years: int
     discount_rate: float          # e.g. 0.06
     budget_eur: float             # total budget
+    lambda_risk: float = 0.0    # risk aversion weight (for CVaR)
+    cvar_alpha: float = 0.90     # CVaR confidence level
 
 @dataclass
 class MarketParamsDeterministic:
