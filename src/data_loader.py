@@ -1,11 +1,18 @@
 # src/data_loader.py
 
 from enum import Enum
+from pathlib import Path
+import sys
 from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
-from config import (
+# Ensure project root is on sys.path when run directly
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.config import (
     get_default_economic_params,
     get_default_market_params_deterministic,
     EconomicParams
