@@ -117,9 +117,24 @@ def _load_market_data_model2(econ_params: EconomicParams) -> Dict[str, Any]:
         for t in range(1, T_periods + 1)
     }
     
-    # Prices (Constant over the periods for this stub)
-    P_DA_stub = {t: market_det.price_da_eur_per_mwh for t in range(1, T_periods + 1)}
-    P_BAL_stub = {t: market_det.price_bal_eur_per_mwh for t in range(1, T_periods + 1)}
+    # 2. Prices (Implementing Annual Decay)
+    
+    # Annual Decay Factor: -1.0% per year (simulating price cannibalization)
+    price_decay_rate = 0.015 
+    
+    P_DA_base = market_det.price_da_eur_per_mwh
+    P_BAL_base = market_det.price_bal_eur_per_mwh
+    
+    # Price in period t: Base Price * (1 - decay_rate)^(t-1)
+    P_DA_stub = {
+        t: P_DA_base * ((1.0 - price_decay_rate) ** (t - 1))
+        for t in range(1, T_periods + 1)
+    }
+    
+    P_BAL_stub = {
+        t: P_BAL_base * ((1.0 - price_decay_rate) ** (t - 1))
+        for t in range(1, T_periods + 1)
+    }
     
     return {
         "type": "multi_period",
