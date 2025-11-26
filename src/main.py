@@ -1,5 +1,3 @@
-# src/main.py
-
 import argparse
 from models.model1_deterministic import build_and_solve_model1
 from models.model2_multi_period import build_and_solve_model2
@@ -15,6 +13,10 @@ def main():
     )
     args = parser.parse_args()
 
+    # Note: Model 1's function is currently called 'solve_model1' in your files,
+    # but the import here refers to the function name inside the file. 
+    # Let's ensure consistency by using 'build_and_solve_modelX' pattern.
+    
     if args.model == "1":
         res = build_and_solve_model1()
     elif args.model == "2":
@@ -22,7 +24,8 @@ def main():
     else:
         res = build_and_solve_model3()
 
-    print("Results:", res)
+    print("Final Model Results:", res)
+
 
 if __name__ == "__main__":
     main()
