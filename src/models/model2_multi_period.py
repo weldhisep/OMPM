@@ -1,12 +1,18 @@
 # src/models/model2_multi_period.py
 
+import sys
 from typing import Dict, Any, Optional
-
+from pathlib import Path
 import gurobipy as gp
 from gurobipy import GRB
 
-from data_loader import load_inputs, ModelType
-from economics import present_value_factor
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data_loader import load_inputs, ModelType
+from src.economics import present_value_factor
 
 
 def build_model2(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
