@@ -14,28 +14,24 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data_loader import load_inputs, ModelType
 from src.economics import present_value_factor
-
+# src/models/model1_deterministic.py
 
 
 def build_model1(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
     """
-    High-realism deterministic offshore wind model (quadratic, Gurobi-compatible):
+    MILP deterministic offshore wind model:
+
+    - S chosen from a discrete set of turbine sizes (binary selection)
+    - N = integer number of turbines
+    - K = S * N (linear because S is defined as sum(s * y_s))
 
     Includes:
-        - Wake losses:      CF = base_cf - wake_coeff * N
-        - Turbine CAPEX:    capex_per_mw = base_cost + slope*(20 - S)
-        - Capacity link:    K = N * S
+        - Wake losses (CF decreases with N)
+        - Turbine-dependent CAPEX (per MW depends on chosen S)
         - Budget constraint
-        - NPV objective (quadratic)
-
-    Excludes:
-        - Cable cost
-        - Price depression (removed to avoid cubic terms)
+        - Linear NPV objective
     """
 
-    # ----------------------------
-    # Load inputs
-    # ----------------------------
     if inputs is None:
         inputs = load_inputs(ModelType.MODEL1_DETERMINISTIC)
 
@@ -50,107 +46,91 @@ def build_model1(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
     variable_opex = float(econ.variable_opex_per_mwh)
     budget = float(econ.budget_eur)
 
-    # ----------------------------
-    # Create model
-    # ----------------------------
-    m = gp.Model("model1_high_realism_quadratic")
-    m.Params.NonConvex = 2     # enable bilinear/quadratic constraints
+    # ---- Available turbine sizes ----
+    turbine_sizes = [12, 15, 18, 20]  # MW
 
-    # ----------------------------
-    # Turbine size bounds (10–25 MW)
-    # ----------------------------
-    S_min = 10.0
-    S_max = 25.0
+    # CAPEX per MW depending on turbine size (higher S = cheaper)
+    capex_map = {
+        12: 3.0e6,
+        15: 2.8e6,
+        18: 2.6e6,
+        20: 2.5e6,
+    }
 
-    # ----------------------------
-    # Decision variables
-    # ----------------------------
-    S = m.addVar(lb=S_min, ub=S_max, vtype=GRB.CONTINUOUS, name="S")  # turbine size [MW]
-    N = m.addVar(lb=0.0, vtype=GRB.INTEGER, name="N")              # number of turbines
-    K = m.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="K")              # total capacity [MW]
+    wake_coeff = 0.0004  # CF loss per turbine
 
-    # ----------------------------
-    # Constraint: K = N * S
-    # ----------------------------
-    m.addQConstr(K == N * S, name="CapacityDefinition")
+    m = gp.Model("model1_MILP")
+    m.Params.MIPGap = 0.0
 
-    # ----------------------------
-    # Wake losses: CF(N)
-    # CF = base_cf - wake_coeff * N
-    # ----------------------------
-    wake_coeff = 0.0004      # ~0.04% loss per turbine
-    CF = base_cf - wake_coeff * N
+    # ---- Variables ----
+    y = m.addVars(turbine_sizes, vtype=GRB.BINARY, name="y")  # size choice
+    N = m.addVar(vtype=GRB.INTEGER, lb=0, name="N")           # number of turbines
+    K = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="K")      # total MW
 
-    # prevent CF < 0
-    m.addConstr(CF >= 0.05, name="MinCF")
+    # ---- Turbine size S derived from y ----
+    S = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="S")
 
-    # annual production per MW
+    m.addConstr(S == gp.quicksum(size * y[size] for size in turbine_sizes), "S_definition")
+
+    # Must choose EXACTLY one turbine size
+    m.addConstr(gp.quicksum(y[size] for size in turbine_sizes) == 1, "OneSize")
+
+    # ---- Link capacity ----
+    m.addConstr(K == N * S, "CapacityDefinition")
+
+    # ---- Wake losses ----
+    CF = m.addVar(lb=0.0, ub=1.0, name="CF")
+    m.addConstr(CF == base_cf - wake_coeff * N, "WakeLoss")
+    m.addConstr(CF >= 0.05, "MinCF")  # Prevent going too low
+
+    # Annual MWh per MW
     annual_mwh = CF * 8760.0
 
-    # ----------------------------
-    # Turbine-dependent CAPEX per MW
-    # larger S → cheaper per MW
-    # ----------------------------
-    base_capex = 2.8e6       # cost at 20 MW turbine
-    capex_slope = 1.4e5      # cost difference per MW relative to 20 MW
+    # ---- CAPEX ----
+    capex_per_mw = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="CAPEX_per_MW")
+    m.addConstr(
+        capex_per_mw == gp.quicksum(capex_map[size] * y[size] for size in turbine_sizes),
+        "CAPEX_selection"
+    )
 
-    # CAPEX per MW is linear in S → ok
-    capex_per_mw = base_capex + capex_slope * (20.0 - S)
+    # Budget: total CAPEX
+    m.addConstr(capex_per_mw * K <= budget, "Budget")
 
-    # Budget: total CAPEX <= Budget
-    m.addConstr(capex_per_mw * K <= budget, name="Budget")
-
-    # ----------------------------
-    # Annual OPEX (per MW)
-    # ----------------------------
-    annual_opex_per_mw = fixed_opex + annual_mwh * variable_opex
-
-    # ----------------------------
-    # Annual revenue:
-    #    revenue = annual_mwh * base_price * K
-    #
-    # This keeps the objective quadratic (CF*N*K is bilinear)
-    # ----------------------------
+    # ---- Revenue and OPEX ----
     annual_revenue = annual_mwh * base_price * K
-
-    # ----------------------------
-    # Total OPEX (and total CAPEX)
-    # ----------------------------
-    total_opex = annual_opex_per_mw * K
+    annual_opex = (fixed_opex + annual_mwh * variable_opex) * K
     total_capex = capex_per_mw * K
 
-    # ----------------------------
-    # Objective: maximize NPV
-    #
-    # NPV = PV(annual_revenue - annual_opex) - CAPEX
-    # ----------------------------
-    NPV = (annual_revenue - total_opex) * pv_factor - total_capex
-
+    # ---- NPV objective (linear because everything is linear in y, N, K) ----
+    NPV = (annual_revenue - annual_opex) * pv_factor - total_capex
     m.setObjective(NPV, GRB.MAXIMIZE)
 
     return m
 
 
-def solve_model1(
-    inputs: Optional[Dict[str, Any]] = None,
-    solver_options: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-
+def solve_model1(inputs=None, solver_options=None):
     m = build_model1(inputs)
 
     if solver_options:
-        for key, val in solver_options.items():
-            m.setParam(key, val)
+        for k, v in solver_options.items():
+            m.setParam(k, v)
 
     m.optimize()
 
-    if m.Status not in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
-        raise RuntimeError(f"Gurobi solver ended with status {m.Status}")
+    if m.Status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        raise RuntimeError(f"Gurobi failed with status {m.Status}")
+
+    # Extract chosen turbine size
+    chosen_size = None
+    for size in [12, 15, 18, 20]:
+        if m.getVarByName(f"y[{size}]").X > 0.5:
+            chosen_size = size
 
     return {
         "model": m,
         "K_opt_mw": m.getVarByName("K").X,
-        "S_opt_mw": m.getVarByName("S").X,
         "N_opt": m.getVarByName("N").X,
+        "S_opt_mw": chosen_size,
+        "CF_opt": m.getVarByName("CF").X,
         "NPV_eur": m.ObjVal,
     }
