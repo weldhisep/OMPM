@@ -1,103 +1,112 @@
 # src/models/model3_stochastic.py
 
 from typing import Dict, Any, Optional
+from pathlib import Path
+import sys
 
 import gurobipy as gp
 from gurobipy import GRB
 
-from data_loader import load_inputs, ModelType
-from economics import present_value_factor
+# Ensure project root is on sys.path when run directly
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data_loader import load_inputs, ModelType
+from src.economics import present_value_factor
 
 
 def build_model3(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
     """
-    Stochastic Model 3 with turbine size and number of turbines (N & S)
-    and CVaR-based risk aversion.
+    Stochastic Model 3 (MILP with scenario-based operational variables)
 
-    VARIABLES:
-        S: turbine size (MW per turbine)
-        N: number of turbines (continuous)
-        K: installed capacity (MW)
-        g[t,s]: realized generation (MW)
-        xi[s]: scenario profit (EUR/year)
-        zeta: VaR threshold
-        eta[s]: CVaR tail variable
-
-    OBJECTIVE:
-        Maximize:  sum_s pi[s] * xi[s] 
-                   - CAPEX*K
-                   - lambda * CVaR_alpha(loss)
-
-    CONSTRAINTS:
-        K = N * S  (nonconvex quadratic)
-        CAPEX * K <= Budget
-        0 <= g[t,s] <= K * rho[t,s]
-        eta_s >= -xi_s - zeta
-        eta_s >= 0
+    - Turbine size chosen from discrete set (binary y[size])
+    - N integer number of turbines
+    - K = N * S (where S = sum(size * y[size]))  -> linear in variables because S uses binaries
+    - Scenario operational variables g[t,s] (realized generation with possible curtailment)
+    - CVaR risk-penalty on losses (loss = -xi: negative operational profit)
+    - Wake losses: capacity factor reduced with more turbines (wake_coeff * N) applied inside g limit
+      (implemented as quadratic constraint because K*N appears)
     """
 
-    # -------------------------------------------------------
-    # Load inputs
-    # -------------------------------------------------------
     if inputs is None:
         inputs = load_inputs(ModelType.MODEL3_STOCHASTIC)
 
     econ = inputs["economics"]
     market = inputs["market"]
-    scenarios = market["scenarios"]   # scenario dict with arrays
 
+    # scenarios loaded under market["scenarios"]
+    scenarios = market.get("scenarios", None)
+    if scenarios is None:
+        raise RuntimeError("No scenarios found in inputs['market']['scenarios']")
 
-    # scenario time series
-    rho = scenarios["rho"]                # capacity factors [T x S]
-    price_da = scenarios["price_da"]      # day-ahead price [T x S]
-    price_bal = scenarios["price_bal"]    # balancing price [T x S]
-    pi = scenarios["probabilities"]       # probabilities [S]
+    rho = scenarios["rho"]                 # shape (T, S)
+    rho_forecast = scenarios["rho_forecast"]
+    price_da = scenarios["price_da"]
+    price_bal = scenarios["price_bal"]
+    pi = scenarios["probabilities"]
 
-    T = rho.shape[0]
-    S_count = rho.shape[1]
+    # Dimensions
+    T = int(rho.shape[0])
+    S_count = int(rho.shape[1])
 
-    # economics
+    # Economic params
     pv_factor = present_value_factor(econ.discount_rate, econ.lifetime_years)
 
-    capex_per_mw = float(econ.capex_per_mw)
     fixed_opex_per_mw_year = float(econ.fixed_opex_per_mw_year)
     variable_opex_per_mwh = float(econ.variable_opex_per_mwh)
-    budget_eur = float(econ.budget_eur)
+    budget = float(econ.budget_eur)
 
-    lambda_risk = float(econ.lambda_risk)      # CVaR weight
-    alpha = float(econ.cvar_alpha)
+    # Risk parameters (ensure exist in config)
+    lambda_risk = float(getattr(econ, "lambda_risk", 0.0))
+    alpha = float(getattr(econ, "cvar_alpha", 0.90))
 
-    # for annual OPEX
-    # fixed OPEX per MW-year
-    # variable OPEX handled via generation * variable_opex_per_mwh
+    # Turbine sizes and CAPEX map (same style as model1)
+    turbine_sizes = [12, 15, 18, 20]  # MW
+    capex_map = {
+        12: 3.0e6,
+        15: 2.8e6,
+        18: 2.6e6,
+        20: 2.5e6,
+    }
 
-    # bidding scheme: forecast-based bid
-    rho_forecast = scenarios["rho_forecast"]    # T x S forecasted CF used for DA bid
+    wake_coeff = 0.0004  # CF loss per turbine (applied to capacity factor)
 
-    # -------------------------------------------------------
     # Create model
-    # -------------------------------------------------------
     m = gp.Model("model3_stochastic")
-
-    # Allow quadratic non-convex K = N * S
+    # allow nonconvex quadratics (we will use K*N in wake term)
     m.Params.NonConvex = 2
+    # tighten MIP tolerance similar to model1 if desired
+    m.Params.MIPGap = 1e-6
 
-    # Turbine size bounds
-    S_min = 8.0
-    S_max = 25.0
+    # ----- Variables -----
+    y = m.addVars(turbine_sizes, vtype=GRB.BINARY, name="y")  # choose turbine size
+    N = m.addVar(vtype=GRB.INTEGER, lb=0, name="N")           # number of turbines
+    K = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="K")      # total MW
 
-    # -------------------------------------------------------
-    # Variables
-    # -------------------------------------------------------
-    S_var = m.addVar(lb=S_min, ub=S_max, vtype=GRB.CONTINUOUS, name="S")
-    N_var = m.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="N")
-    K_var = m.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="K")
+    # S derived from y (continuous)
+    S = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="S")
+    m.addConstr(S == gp.quicksum(size * y[size] for size in turbine_sizes), "S_definition")
+    m.addConstr(gp.quicksum(y[size] for size in turbine_sizes) == 1, "OneSize")
 
-    # Scenario generation variables
+    # Link capacity K = N * S (nonlinear)
+    # Keep as a quadratic constraint consistent with Model 1 style
+    m.addQConstr(K == N * S, "CapacityDefinition")
+
+    # Select CAPEX per MW according to chosen size
+    CAPEX_per_MW = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="CAPEX_per_MW")
+    m.addConstr(
+        CAPEX_per_MW == gp.quicksum(capex_map[size] * y[size] for size in turbine_sizes),
+        "CAPEX_selection"
+    )
+
+    # Budget constraint
+    m.addConstr(CAPEX_per_MW * K <= budget, "Budget")
+
+    # Scenario operational variables
     g = {}
     xi = {}
     eta = {}
-
     for s in range(S_count):
         xi[s] = m.addVar(lb=-GRB.INFINITY, name=f"xi_s{s}")
         eta[s] = m.addVar(lb=0.0, name=f"eta_s{s}")
@@ -109,76 +118,63 @@ def build_model3(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
 
     m.update()
 
-    # -------------------------------------------------------
-    # Constraints
-    # -------------------------------------------------------
-
-    # K = N * S (nonconvex quadratic)
-    m.addQConstr(K_var == N_var * S_var, name="CapacityDefinition")
-
-    # Budget constraint
-    m.addConstr(capex_per_mw * K_var <= budget_eur, name="Budget")
-
-    # Generation limits: 0 <= g[t,s] <= K * rho[t,s]
+    # ----- Constraints: generation limits with wake loss -----
+    # g[t,s] <= K * (rho[t,s] - wake_coeff * N)
+    # rearranged to a quadratic form: g + wake_coeff * K * N <= K * rho
     for s in range(S_count):
         for t in range(T):
-            m.addConstr(
-                g[(t, s)] <= K_var * rho[t, s],
-                name=f"GenLimit_t{t}_s{s}"
-            )
+            # Left side: g + wake_coeff * K * N
+            # Right side: K * rho[t,s]
+            # Use addQConstr to allow K*N product
+            # g[(t,s)] + wake_coeff * K * N <= K * rho[t,s]
+            expr_left = gp.QuadExpr()
+            expr_left.add(g[(t, s)])
+            # add quadratic term wake_coeff * K * N
+            expr_left.add(wake_coeff * K * N)
+            # addQConstr(expr_left <= K * rho)
+            m.addQConstr(expr_left <= K * float(rho[t, s]), name=f"GenLimit_t{t}_s{s}")
 
-    # -------------------------------------------------------
-    # Profit Definition (CORRECTED TIME SCALING)
-    # -------------------------------------------------------
-    
-    # Scaling factor to convert simulation horizon (e.g., 24h) to one year (8760h)
+    # ----- Profit definition -----
+    # We treat the simulation horizon of length T as representative and scale to annual.
     hours_per_year = 8760.0
-    time_scale_factor = hours_per_year / T
+    time_scale = hours_per_year / float(T)
 
-    # xi_s = (Daily_Operational_Profit * Scale_Factor) - Fixed_Annual_OPEX
     for s in range(S_count):
-        op_profit_expr = gp.LinExpr() # Operational profit for the simulated horizon
-
+        op_expr = gp.LinExpr()  # operational profit over simulated horizon (not ann.)
         for t in range(T):
-            # day-ahead bid = K * rho_forecast
-            b_coeff = rho_forecast[t, s]     # bid = K_var * b_coeff
+            # day-ahead bid = K * rho_forecast[t,s]
+            b_coeff = float(rho_forecast[t, s])
 
-            # DA revenue
-            op_profit_expr.addTerms(b_coeff * price_da[t, s], K_var)
+            # DA revenue: b * price_da --> (b_coeff * K) * price_da
+            op_expr.addTerms(b_coeff * float(price_da[t, s]), K)
 
-            # balancing revenue: (g - bid) * price_bal
-            op_profit_expr.add(g[(t, s)], price_bal[t, s])
-            op_profit_expr.addTerms(-b_coeff * price_bal[t, s], K_var)
+            # balancing revenue: (g - b) * price_bal -> g * p_bal - b * p_bal
+            op_expr.add(g[(t, s)], float(price_bal[t, s]))
+            op_expr.addTerms(-b_coeff * float(price_bal[t, s]), K)
 
-            # variable OPEX
-            op_profit_expr.add(g[(t, s)], -variable_opex_per_mwh)
-        
-        # Combine into annual profit:
-        # xi[s] = (Operational Profit * Scale Factor) - Annual Fixed OPEX
-        total_annual_expr = gp.LinExpr()
-        total_annual_expr.add(op_profit_expr, time_scale_factor)
-        total_annual_expr.addTerms(-fixed_opex_per_mw_year, K_var)
+            # variable OPEX: -variable_opex_per_mwh * g
+            op_expr.add(g[(t, s)], -variable_opex_per_mwh)
 
-        m.addConstr(xi[s] == total_annual_expr, name=f"ProfitDef_s{s}")
+        # scale operational profit to annual
+        total_annual_op = gp.LinExpr()
+        total_annual_op.add(op_expr, time_scale)
 
-    # CVaR constraints
+        # subtract fixed annual OPEX: fixed_opex_per_mw_year * K
+        total_annual_op.addTerms(-fixed_opex_per_mw_year, K)
+
+        # xi[s] is annual operational profit (excludes CAPEX)
+        m.addConstr(xi[s] == total_annual_op, name=f"ProfitDef_s{s}")
+
+    # CVaR constraints: eta_s >= -xi_s - zeta
     for s in range(S_count):
-        # eta_s >= loss_s - zeta = -xi_s - zeta
         m.addConstr(eta[s] >= -xi[s] - zeta, name=f"CVaR_eta_s{s}")
 
-    # -------------------------------------------------------
-    # Objective
-    # -------------------------------------------------------
+    # ----- Objective -----
+    expected_operational = gp.quicksum(pi[s] * xi[s] for s in range(S_count))
+    cvar_term = zeta + gp.quicksum(pi[s] * eta[s] / (1.0 - alpha) for s in range(S_count))
 
-    expected_profit = gp.quicksum(pi[s] * xi[s] for s in range(S_count))
-
-    cvar_term = zeta + gp.quicksum(pi[s] * eta[s] / (1 - alpha) for s in range(S_count))
-
-    total_npv = (
-        pv_factor * expected_profit
-        - capex_per_mw * K_var          # CAPEX
-        - lambda_risk * cvar_term
-    )
+    # Total NPV: PV(expected operational) - CAPEX - lambda * CVaR
+    total_npv = pv_factor * expected_operational - CAPEX_per_MW * K - lambda_risk * cvar_term
 
     m.setObjective(total_npv, GRB.MAXIMIZE)
 
@@ -189,6 +185,9 @@ def solve_model3(
     inputs: Optional[Dict[str, Any]] = None,
     solver_options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Build and solve Model 3. Returns results similar to Model 1.
+    """
 
     m = build_model3(inputs)
 
@@ -198,14 +197,21 @@ def solve_model3(
 
     m.optimize()
 
-    if m.Status not in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
-        raise RuntimeError(f"Gurobi ended with status {m.Status}")
+    if m.Status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        raise RuntimeError(f"Gurobi failed with status {m.Status}")
+
+    # Extract chosen turbine size (y[size])
+    chosen_size = None
+    for size in [12, 15, 18, 20]:
+        var = m.getVarByName(f"y[{size}]")
+        if var is not None and var.X > 0.5:
+            chosen_size = size
 
     return {
         "model": m,
         "K_opt_mw": m.getVarByName("K").X,
-        "S_opt_mw": m.getVarByName("S").X,
         "N_opt": m.getVarByName("N").X,
+        "S_opt_mw": chosen_size,
         "NPV_eur": m.ObjVal,
         "zeta": m.getVarByName("zeta").X,
     }
