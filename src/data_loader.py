@@ -120,7 +120,7 @@ def _load_market_data_model2(econ_params: EconomicParams) -> Dict[str, Any]:
     # 2. Prices (Implementing Annual Decay)
     
     # Annual Decay Factor: -1.0% per year (simulating price cannibalization)
-    price_decay_rate = 0.015 
+    price_decay_rate = 0.0 
     
     P_DA_base = market_det.price_da_eur_per_mwh
     P_BAL_base = market_det.price_bal_eur_per_mwh
@@ -143,8 +143,7 @@ def _load_market_data_model2(econ_params: EconomicParams) -> Dict[str, Any]:
         "W_R": W_R_stub,     # Realized MWh/MW/period
         "P_DA": P_DA_stub,   # Day-Ahead Price (EUR/MWh)
         "P_BAL": P_BAL_stub, # Balancing Price (EUR/MWh)
-        
-        # Additional metadata
+        "capacity_factor": market_det.capacity_factor,
         "time_index": list(range(1, T_periods + 1)),
         "da_prices": P_DA_stub,
         "bal_prices": P_BAL_stub,

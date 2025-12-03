@@ -16,52 +16,39 @@ from src.economics import present_value_factor
 
 
 def build_model2(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
-    """
-    Multi-Period Model 2: Optimizes the one-time installed capacity (C)
-    based on annual time-series data for wind production (W_F, W_R) and prices (P_DA, P_BAL).
-    
-    The objective maximizes the Net Present Value (NPV) over the project lifetime.
-    
-    NOTE: This model assumes the Day-Ahead commitment is implicitly equal to the 
-    forecasted production (C * W_F[t]).
-
-    VARIABLES:
-        C: Installed Capacity (MW) - continuous decision variable
-    
-    CONSTRAINTS:
-        1) CAPEX * C <= Budget
-        
-    OBJECTIVE (Maximize NPV):
-        MAX: SUM_t [ (R^DA_t + R^B_t - K_t) / (1 + r)^t ] - COST^CAPEX
-    """
-
     # ---- Load inputs ----
     # This check is crucial for running 'build_model2' directly
     if inputs is None:
         inputs = load_inputs(ModelType.MODEL2_MULTI_PERIOD)
-
-    # Sanity check for data loading success
-    if not isinstance(inputs, dict):
-         raise RuntimeError("Data loading failed: 'inputs' is not a dictionary. Check load_inputs() in data_loader.py.")
 
     econ = inputs["economics"]
     market = inputs["market"]
 
     # Economic Parameters (Constants)
     r = econ.discount_rate
-    
-    # Check for T_periods to ensure market data is complete
-    if "T_periods" not in market:
-        # If the market data stub is incomplete, this will be a useful error
-        raise KeyError("Market data is missing required key 'T_periods'. Please complete _load_market_data_model2() in data_loader.py.")
+    base_cf = float(market["capacity_factor"])
 
+    
     T_periods = market["T_periods"]
     
-    capex_per_mw = float(econ.capex_per_mw)
     fixed_opex_per_mw_year = float(econ.fixed_opex_per_mw_year)
     variable_opex_per_mwh = float(econ.variable_opex_per_mwh)
-    budget_eur = float(econ.budget_eur)
+    budget = float(econ.budget_eur)
+    
+    # ---- Available turbine sizes ----
+    turbine_sizes = [12, 15, 18, 20]  # MW
 
+    # CAPEX per MW depending on turbine size (higher S = cheaper)
+    capex_map = {
+        12: 3.0e6,
+        15: 2.8e6,
+        18: 2.6e6,
+        20: 2.5e6,
+    }
+
+    
+    wake_coeff = 0.0004  # CF loss per turbine
+    
     # Market Data (Time-indexed dictionaries)
     W_F = market["W_F"]     # Forecasted MWh/MW/period (for DA bid)
     W_R = market["W_R"]     # Realized MWh/MW/period (for Imbalance)
@@ -70,58 +57,61 @@ def build_model2(inputs: Optional[Dict[str, Any]] = None) -> gp.Model:
 
     # ---- Model Setup ----
     m = gp.Model("Model2_Multi_Period")
-    # Silence output for cleaner console
     m.setParam('OutputFlag', 0) 
 
-    # ---- Decision Variables ----
-    # C: Installed Capacity (MW)
-    # The capacity is a continuous variable, fixed for all time periods.
-    C = m.addVar(lb=0, name="Installed_Capacity_MW", vtype=GRB.CONTINUOUS)
+    # ---- Variables ----
+    y = m.addVars(turbine_sizes, vtype=GRB.BINARY, name="y")  # size choice
+    N = m.addVar(vtype=GRB.INTEGER, lb=0, name="N")           # number of turbines
+    K = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="K")      # total MW
+
+    # ---- Turbine size S derived from y ----
+    S = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="S")
+
+    m.addConstr(S == gp.quicksum(size * y[size] for size in turbine_sizes), "S_definition")
+
+    # Must choose EXACTLY one turbine size
+    m.addConstr(gp.quicksum(y[size] for size in turbine_sizes) == 1, "OneSize")
+
+    # ---- Link capacity ----
+    m.addConstr(K == N * S, "CapacityDefinition")
+
+    # ---- Wake losses ----
+    CF = m.addVar(lb=0.0, ub=1.0, name="CF")
+    m.addConstr(CF == base_cf - wake_coeff * N, "WakeLoss")
+    m.addConstr(CF >= 0.05, "MinCF")  # Prevent going too low
+
 
     # ---- Constraints ----
     # 1. Budget constraint: CAPEX * C <= Budget
-    m.addConstr(capex_per_mw * C <= budget_eur, name="Budget_Limit")
+    capex_per_mw = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="CAPEX_per_MW")
+    m.addConstr(
+        capex_per_mw == gp.quicksum(capex_map[size] * y[size] for size in turbine_sizes),
+        "CAPEX_selection"
+    )
+    # Budget: total CAPEX
+    total_capex = capex_per_mw * K
+    m.addConstr(capex_per_mw * K <= budget, "Budget")
 
     # ---- Objective Calculation (NPV) ----
 
-    # 1. CAPEX Cost (occurs at t=0, no discounting)
-    capex_cost = capex_per_mw * C
-
-    # 2. Annual Operating Margin (Per Period Cash Flow)
     npv_sum = 0.0
 
     # Iterate over all periods (t=1 to T_periods)
     for t in range(1, T_periods + 1):
-        # A. Revenues from Day-Ahead (DA) Market (Assuming commitment = forecast)
-        # R^DA_t = P^DA_t * C * W^F_t
-        revenue_da = P_DA[t] * C * W_F[t]
+        scaling_factor = CF / base_cf  # Adjust production for wake losses
+        annual_mwh_per_mw_adj_F = W_F[t] * scaling_factor # Adjusted forecasted production
+        annual_mwh_per_mw_adj_R = W_R[t] * scaling_factor # Adjusted realized production
+        discount_factor = 1.0 / ((1.0 + r) ** t) # Discount factor for period t        
+        revenue_da = P_DA[t] * annual_mwh_per_mw_adj_F * K # Revenue from Day-Ahead market
+        revenue_bal = P_BAL[t] * (annual_mwh_per_mw_adj_R - annual_mwh_per_mw_adj_F) * K # Revenue from Balancing market
+        opex_fixed = fixed_opex_per_mw_year * K # Fixed OPEX is based on installed capacity
+        opex_variable = variable_opex_per_mwh * annual_mwh_per_mw_adj_R * K # Variable OPEX is based on realized MWh
+        net_cash_flow_t = revenue_da + revenue_bal - (opex_fixed + opex_variable) # Net cash flow for period t
+        npv_sum += net_cash_flow_t * discount_factor # Add discounted cash flow to NPV sum
 
-        # B. Revenue/Cost from Balancing (B) Market
-        # R^B_t = P^B_t * C * (W^R_t - W^F_t)
-        # Note: (W^R_t - W^F_t) is the imbalance per MW. If negative, R^B_t is a cost.
-        imbalance_per_mw = W_R[t] - W_F[t]
-        revenue_bal = P_BAL[t] * C * imbalance_per_mw
-
-        # C. Operating Costs (OPEX)
-        # Fixed OPEX (per MW of capacity) * C
-        fixed_opex = fixed_opex_per_mw_year * C
-        # Variable OPEX (per MWh of realized production) * C * W_R_t
-        variable_opex = variable_opex_per_mwh * C * W_R[t]
-        
-        # Total OPEX for period t
-        operating_cost = fixed_opex + variable_opex
-        
-        # Net Cash Flow for Period t
-        net_cash_flow_t = revenue_da + revenue_bal - operating_cost
-
-        # Discount Factor for Period t: 1 / (1 + r)^t
-        discount_factor_t = 1.0 / ((1.0 + r) ** t)
-        
-        # Add Present Value of Cash Flow to the NPV sum
-        npv_sum += net_cash_flow_t * discount_factor_t
 
     # Total NPV = SUM(Discounted Cash Flows) - CAPEX Cost
-    total_npv = npv_sum - capex_cost
+    total_npv = npv_sum - total_capex 
     
     # Set Objective
     m.setObjective(total_npv, GRB.MAXIMIZE)
@@ -136,17 +126,11 @@ def build_and_solve_model2(
     """
     Build and solve Model 2 with Gurobi.
     Returns a dict with optimal values and the Gurobi model object.
-    
-    The 'inputs' dict is loaded here if not provided, to ensure data is available 
-    for the results summary.
     """
-    
-    # 1. Load Inputs 
-    # We load the inputs here so they are available for printing the results at the end.
     if inputs is None:
         inputs = load_inputs(ModelType.MODEL2_MULTI_PERIOD)
     
-    # CRITICAL: If data_loader.py fails to return a dictionary, we must stop here.
+#   If data_loader.py fails to return a dictionary, we must stop here.
     if inputs is None or not isinstance(inputs, dict):
         raise RuntimeError(
             "Data loading failed: 'inputs' is None or not a dictionary. "
@@ -155,35 +139,38 @@ def build_and_solve_model2(
         )
 
 
-    # 2. Build Model (pass loaded inputs)
     m = build_model2(inputs)
 
-    # 3. Extra options if needed
     if solver_options:
         for k, v in solver_options.items():
             m.setParam(k, v)
     
-    # 4. Solve the model
     m.optimize()
-
-    # ---- Process Results ----
-    
+    results = {}
     if m.status == GRB.OPTIMAL:
         # Get optimal capacity
-        C_opt = m.getVarByName("Installed_Capacity_MW").X
+        C_opt = m.getVarByName("K").X
+        N_opt = m.getVarByName("N").X
+        CF_opt = m.getVarByName("CF").X
         
-        # Total NPV (Objective value)
+        turbine_size = [12, 15, 18, 20]
+        chosen_size = None
+        for size in turbine_size:
+            if m.getVarByName(f"y[{size}]").X > 0.5:
+                chosen_size = size
+                break
+        
         npv_eur = m.objVal
-        
-        # Calculate the CAPEX used
-        # This access is now safe because we checked 'inputs' is a dict above.
-        capex_per_mw = inputs["economics"].capex_per_mw 
+        capex_per_mw = m.getVarByName("CAPEX_per_MW").X 
         capex_used = C_opt * capex_per_mw
         
         # Print Summary
         print(f"\n--- Model 2 Solution ({inputs['market']['T_periods']} periods) ---")
         print(f"Status: {m.status} (OPTIMAL)")
-        print(f"Optimal Installed Capacity (C*): {C_opt:,.2f} MW")
+        print(f"Optimal Installed Capacity (K*): {C_opt:,.2f} MW")
+        print(f"Optimal Number of Turbines (N*): {N_opt:,.2f} units")
+        print(f"Optimal Turbine Size (S*): {chosen_size} MW")
+        print(f"Optimal Capacity Factor (CF*): {CF_opt:.4f}")
         print(f"Project NPV (Max Profit): {npv_eur:,.0f} EUR")
         print(f"Total CAPEX used: {capex_used:,.0f} EUR")
         print(f"Budget: {inputs['economics'].budget_eur:,.0f} EUR")
@@ -191,14 +178,17 @@ def build_and_solve_model2(
 
 
         results = {
-            "C_opt_mw": C_opt,
+            "K_opt_mw": C_opt,
+            "N_opt": N_opt,
+            "S_opt_mw": chosen_size,
+            "CF_opt": CF_opt,
             "NPV_eur": npv_eur,
             "Gurobi_Model": m
         }
     else:
-        print(f"Optimization failed with status {m.status}. See Gurobi documentation for status codes.")
+        print(f"Optimization failed with status {m.Status}. See Gurobi documentation for status codes.")
         results = {
-            "C_opt_mw": 0.0,
+            "K_opt_mw": 0.0,
             "NPV_eur": 0.0,
             "Gurobi_Model": m
         }
